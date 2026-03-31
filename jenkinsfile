@@ -1,0 +1,269 @@
+// ============================================================
+// Snowman Enterprise App - Jenkins Declarative Pipeline
+// Stages: Checkout → Build → Test → Package → Deploy
+// ============================================================
+ 
+pipeline {
+    agent any
+ 
+    tools {
+        maven 'Maven-3.6.3'
+        jdk   'JDK-8'
+    }
+ 
+    environment {
+        APP_NAME        = 'snowman'
+        AWS_REGION      = 'ap-south-1'
+        ECR_REGISTRY    = credentials('ecr-registry-url')
+        S3_BUCKET       = 'snowman-artifacts-prod'
+        SONAR_HOST_URL  = credentials('sonar-host-url')
+        SONAR_TOKEN     = credentials('sonar-token')
+        SLACK_CHANNEL   = '#deployments'
+    }
+ 
+    parameters {
+        choice(name: 'ENVIRONMENT', choices: ['dev', 'staging', 'prod'], description: 'Deploy target')
+        booleanParam(name: 'SKIP_TESTS', defaultValue: false, description: 'Skip unit/integration tests')
+        string(name: 'VERSION_TAG', defaultValue: '', description: 'Override version tag (leave empty for auto)')
+    }
+ 
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timeout(time: 60, unit: 'MINUTES')
+        timestamps()
+        disableConcurrentBuilds()
+    }
+ 
+    stages {
+ 
+        // ── STAGE 1: Checkout ────────────────────────────────────────────────
+        stage('Checkout') {
+            steps {
+                echo "🔍 Checking out: ${env.BRANCH_NAME} @ ${env.GIT_COMMIT}"
+                checkout scm
+                script {
+                    env.GIT_SHORT_COMMIT = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+                    env.BUILD_VERSION    = params.VERSION_TAG ?: "${env.BUILD_NUMBER}-${env.GIT_SHORT_COMMIT}"
+                    echo "Build version: ${env.BUILD_VERSION}"
+                }
+            }
+        }
+ 
+        // ── STAGE 2: Compile ─────────────────────────────────────────────────
+        stage('Compile') {
+            steps {
+                sh 'mvn clean compile -B'
+            }
+            post {
+                failure { slackNotify('COMPILE FAILED', 'danger') }
+            }
+        }
+ 
+        // ── STAGE 3: Unit Tests ──────────────────────────────────────────────
+        stage('Unit Tests') {
+            when { expression { !params.SKIP_TESTS } }
+ 
+            steps {
+                sh 'mvn test -B'
+            }
+ 
+            post {
+                always {
+                    junit 'target/surefire-reports/*.xml'
+                    jacoco(
+                        execPattern: 'target/jacoco.exec',
+                        classPattern: 'target/classes',
+                        sourcePattern: 'src/main/java'
+                    )
+                }
+                failure { slackNotify('UNIT TESTS FAILED', 'danger') }
+            }
+        }
+ 
+        // ── STAGE 4: Integration Tests ───────────────────────────────────────
+        stage('Integration Tests') {
+            when { expression { !params.SKIP_TESTS } }
+ 
+            steps {
+                // Spin up test containers via Docker Compose
+                sh 'docker-compose -f docker/docker-compose.yml up -d mysql activemq'
+                sh 'sleep 30'
+                sh 'mvn verify -B -Pfull-integration'
+            }
+ 
+            post {
+                always {
+                    sh 'docker-compose -f docker/docker-compose.yml down || true'
+                    junit allowEmptyResults: true, testResults: 'target/failsafe-reports/*.xml'
+                }
+                failure { slackNotify('INTEGRATION TESTS FAILED', 'danger') }
+            }
+        }
+ 
+        // ── STAGE 5: SonarQube Analysis ──────────────────────────────────────
+        stage('Code Quality - SonarQube') {
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    sh """
+                        mvn sonar:sonar \
+                          -Dsonar.projectKey=${APP_NAME} \
+                          -Dsonar.host.url=${SONAR_HOST_URL} \
+                          -Dsonar.login=${SONAR_TOKEN}
+                    """
+                }
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+ 
+        // ── STAGE 6: Package Uber JAR ─────────────────────────────────────────
+        stage('Package Uber JAR') {
+            steps {
+                sh 'mvn package -DskipTests -B'
+                sh "mv target/Snowman.jar target/Snowman-${BUILD_VERSION}.jar"
+                archiveArtifacts artifacts: "target/Snowman-${BUILD_VERSION}.jar", fingerprint: true
+            }
+        }
+ 
+        // ── STAGE 7: Upload to S3 ─────────────────────────────────────────────
+        stage('Upload to S3') {
+            steps {
+                withAWS(region: env.AWS_REGION, credentials: 'aws-jenkins-creds') {
+                    s3Upload(
+                        file: "target/Snowman-${BUILD_VERSION}.jar",
+                        bucket: env.S3_BUCKET,
+                        path: "releases/${BUILD_VERSION}/Snowman.jar"
+                    )
+                    s3Upload(
+                        file: "target/Snowman-${BUILD_VERSION}.jar",
+                        bucket: env.S3_BUCKET,
+                        path: "releases/latest/Snowman.jar"
+                    )
+                }
+                echo "✅ Artifact uploaded to s3://${S3_BUCKET}/releases/${BUILD_VERSION}/"
+            }
+        }
+ 
+        // ── STAGE 8: Docker Build & Push ──────────────────────────────────────
+        stage('Docker Build & Push') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch 'master'
+                }
+            }
+            steps {
+                withAWS(region: env.AWS_REGION, credentials: 'aws-jenkins-creds') {
+                    script {
+                        sh "aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}"
+                        sh """
+                            docker build -f docker/Dockerfile \
+                              -t ${ECR_REGISTRY}/snowman:${BUILD_VERSION} \
+                              -t ${ECR_REGISTRY}/snowman:latest \
+                              .
+                            docker push ${ECR_REGISTRY}/snowman:${BUILD_VERSION}
+                            docker push ${ECR_REGISTRY}/snowman:latest
+                        """
+                    }
+                }
+            }
+        }
+ 
+        // ── STAGE 9: Run DB Migrations ────────────────────────────────────────
+        stage('Database Migration') {
+            when {
+                anyOf { branch 'main'; branch 'master' }
+            }
+            steps {
+                withAWS(region: env.AWS_REGION, credentials: 'aws-jenkins-creds') {
+                    withCredentials([
+                        string(credentialsId: 'db-url', variable: 'DB_URL'),
+                        usernamePassword(credentialsId: 'db-creds', usernameVariable: 'DB_USER', passwordVariable: 'DB_PASS')
+                    ]) {
+                        sh """
+                            mvn liquibase:update \
+                              -Dliquibase.url=${DB_URL} \
+                              -Dliquibase.username=${DB_USER} \
+                              -Dliquibase.password=${DB_PASS}
+                        """
+                    }
+                }
+            }
+        }
+ 
+        // ── STAGE 10: Deploy ──────────────────────────────────────────────────
+        stage('Deploy') {
+            when {
+                anyOf { branch 'main'; branch 'master' }
+            }
+            steps {
+                script {
+                    def asgName = "snowman-${params.ENVIRONMENT}-asg"
+                    withAWS(region: env.AWS_REGION, credentials: 'aws-jenkins-creds') {
+                        sh """
+                            aws autoscaling start-instance-refresh \
+                              --auto-scaling-group-name ${asgName} \
+                              --strategy Rolling \
+                              --preferences '{"MinHealthyPercentage": 75, "InstanceWarmup": 120}' \
+                              --region ${AWS_REGION}
+                        """
+                        echo "🚀 Rolling deployment triggered on ASG: ${asgName}"
+                    }
+                }
+            }
+        }
+ 
+        // ── STAGE 11: Smoke Test ──────────────────────────────────────────────
+        stage('Smoke Test') {
+            when {
+                anyOf { branch 'main'; branch 'master' }
+            }
+            steps {
+                script {
+                    sleep 90 // Wait for instances to refresh
+                    def albDns = params.ENVIRONMENT == 'prod' ?
+                        env.PROD_ALB_DNS : env.STAGING_ALB_DNS
+ 
+                    sh """
+                        for i in {1..10}; do
+                            if curl -sf http://${albDns}/health; then
+                                echo "✅ Health check passed on attempt \$i"
+                                exit 0
+                            fi
+                            echo "Attempt \$i failed, retrying in 15s..."
+                            sleep 15
+                        done
+                        echo "❌ Smoke test failed after 10 attempts"
+                        exit 1
+                    """
+                }
+            }
+        }
+    }
+ 
+    post {
+        success {
+            slackNotify("✅ ${APP_NAME} v${BUILD_VERSION} deployed to ${params.ENVIRONMENT} successfully!", 'good')
+        }
+        failure {
+            slackNotify("❌ Pipeline FAILED for ${APP_NAME} on branch ${env.BRANCH_NAME}", 'danger')
+        }
+        unstable {
+            slackNotify("⚠️ Pipeline UNSTABLE for ${APP_NAME} - check test results", 'warning')
+        }
+        always {
+            cleanWs()
+        }
+    }
+}
+ 
+// ─── Helper function ──────────────────────────────────────────────────────────
+def slackNotify(String message, String color) {
+    slackSend(
+        channel: env.SLACK_CHANNEL,
+        color: color,
+        message: "${message}\nJob: ${env.JOB_NAME} #${env.BUILD_NUMBER}\n${env.BUILD_URL}"
+    )
+}
+ 
