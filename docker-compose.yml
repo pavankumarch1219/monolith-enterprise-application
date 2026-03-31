@@ -1,0 +1,151 @@
+version: '3.8'
+
+# ============================================================
+# Snowman Enterprise App - Local Dev Stack
+# Services: App (x2 for HA), MySQL, ActiveMQ
+# ============================================================
+
+services:
+
+  # ─── MySQL Database ───────────────────────────────────────
+  mysql:
+    image: mysql:5.7
+    container_name: snowman-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: snowman
+      MYSQL_USER: snowman_user
+      MYSQL_PASSWORD: snowman_pass
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./init-scripts:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpassword"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - snowman-net
+
+  # ─── Apache ActiveMQ (JMS Broker) ─────────────────────────
+  activemq:
+    image: rmohr/activemq:5.15.9
+    container_name: snowman-activemq
+    restart: unless-stopped
+    ports:
+      - "61616:61616"   # JMS
+      - "8161:8161"     # Admin Web UI
+    environment:
+      ACTIVEMQ_ADMIN_LOGIN: admin
+      ACTIVEMQ_ADMIN_PASSWORD: admin
+    volumes:
+      - activemq_data:/opt/activemq/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8161/admin"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - snowman-net
+
+  # ─── Database Migration (Liquibase) ───────────────────────
+  liquibase-migrate:
+    image: maven:3.6.3-jdk-8
+    container_name: snowman-liquibase
+    working_dir: /app
+    volumes:
+      - ../../:/app
+    command: >
+      mvn liquibase:update
+      -Dliquibase.url=jdbc:mysql://mysql:3306/snowman
+      -Dliquibase.username=snowman_user
+      -Dliquibase.password=snowman_pass
+    depends_on:
+      mysql:
+        condition: service_healthy
+    networks:
+      - snowman-net
+
+  # ─── Snowman App - Node 1 ─────────────────────────────────
+  snowman-app-1:
+    build:
+      context: ../../
+      dockerfile: docker/Dockerfile
+    container_name: snowman-app-1
+    restart: unless-stopped
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: snowman
+      DB_USER: snowman_user
+      DB_PASSWORD: snowman_pass
+      ACTIVEMQ_HOST: activemq
+      ACTIVEMQ_PORT: 61616
+      SERVER_PORT: 8080
+    ports:
+      - "8080:8080"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      activemq:
+        condition: service_healthy
+    networks:
+      - snowman-net
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+
+  # ─── Snowman App - Node 2 (Horizontal Scaling) ────────────
+  snowman-app-2:
+    build:
+      context: ../../
+      dockerfile: docker/Dockerfile
+    container_name: snowman-app-2
+    restart: unless-stopped
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: snowman
+      DB_USER: snowman_user
+      DB_PASSWORD: snowman_pass
+      ACTIVEMQ_HOST: activemq
+      ACTIVEMQ_PORT: 61616
+      SERVER_PORT: 8080
+    ports:
+      - "8081:8080"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      activemq:
+        condition: service_healthy
+    networks:
+      - snowman-net
+
+  # ─── NGINX Load Balancer ──────────────────────────────────
+  nginx:
+    image: nginx:alpine
+    container_name: snowman-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - snowman-app-1
+      - snowman-app-2
+    networks:
+      - snowman-net
+
+volumes:
+  mysql_data:
+  activemq_data:
+
+networks:
+  snowman-net:
+    driver: bridge
