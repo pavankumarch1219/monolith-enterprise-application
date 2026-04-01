@@ -1,103 +1,101 @@
 version: '3.8'
 
 # ============================================================
-# Snowman Enterprise App — LOCAL DEV Stack (Azure-aligned)
-# Changes from original:
-#   - Secrets via .env file (never hardcoded)
-#   - Image tag variable for ACR-pulled images
-#   - MySQL 5.7 kept (matches Azure DB for MySQL Flexible)
-#   - ActiveMQ kept (no change needed)
-#   - Liquibase migration kept
-#   - NGINX kept for local HA simulation
+# Snowman Enterprise App — Docker Compose
+# Registry  : DockerHub  (image pulled from DOCKERHUB_USERNAME/snowman-app)
+# Services  : App (x2 HA)  · MySQL 5.7  · ActiveMQ 5.15.9
+#             Liquibase migration  · NGINX load-balancer
+# Usage     :
+#   Local dev  → docker compose --env-file .env.local up
+#   Production → image tag injected by ADO pipeline via IMAGE_TAG env var
 # ============================================================
 
 services:
 
   # ─── MySQL 5.7 ────────────────────────────────────────────
-  # NOTE: In production/Azure, point DB_HOST to your
-  #       Azure Database for MySQL Flexible Server hostname.
   mysql:
     image: mysql:5.7
     container_name: snowman-mysql
     restart: unless-stopped
     environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
-      MYSQL_DATABASE: ${DB_NAME}
-      MYSQL_USER: ${DB_USER}
-      MYSQL_PASSWORD: ${DB_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      MYSQL_DATABASE:      snowman
+      MYSQL_USER:          snowman_user
+      MYSQL_PASSWORD:      ${DB_PASSWORD}
     ports:
       - "3306:3306"
     volumes:
       - mysql_data:/var/lib/mysql
-      - ./init-scripts:/docker-entrypoint-initdb.d
+      - ./init-scripts:/docker-entrypoint-initdb.d   # optional seed SQL
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost",
-             "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
+             "-u", "root", "-p${DB_ROOT_PASSWORD}"]
       interval: 10s
-      timeout: 5s
-      retries: 10
+      timeout:  5s
+      retries:  10
+      start_period: 30s
     networks:
       - snowman-net
 
-  # ─── Apache ActiveMQ 5.15.9 ───────────────────────────────
+  # ─── Apache ActiveMQ 5.15.9 (JMS Broker) ─────────────────
   activemq:
     image: rmohr/activemq:5.15.9
     container_name: snowman-activemq
     restart: unless-stopped
     ports:
-      - "61616:61616"   # JMS
-      - "8161:8161"     # Admin Web UI  →  http://localhost:8161
+      - "61616:61616"    # JMS / OpenWire
+      - "8161:8161"      # Admin Web UI
     environment:
-      ACTIVEMQ_ADMIN_LOGIN: ${ACTIVEMQ_ADMIN_LOGIN}
-      ACTIVEMQ_ADMIN_PASSWORD: ${ACTIVEMQ_ADMIN_PASSWORD}
+      ACTIVEMQ_ADMIN_LOGIN:    admin
+      ACTIVEMQ_ADMIN_PASSWORD: ${ACTIVEMQ_PASSWORD}
     volumes:
       - activemq_data:/opt/activemq/data
     healthcheck:
-      test: ["CMD", "curl", "-f",
-             "http://${ACTIVEMQ_ADMIN_LOGIN}:${ACTIVEMQ_ADMIN_PASSWORD}@localhost:8161/admin"]
+      test: ["CMD", "curl", "-sf",
+             "http://admin:${ACTIVEMQ_PASSWORD}@localhost:8161/admin"]
       interval: 15s
-      timeout: 5s
-      retries: 5
+      timeout:  5s
+      retries:  5
+      start_period: 20s
     networks:
       - snowman-net
 
-  # ─── Liquibase DB Migration ───────────────────────────────
+  # ─── Liquibase DB Migration (run-once job) ─────────────────
   liquibase-migrate:
     image: maven:3.6.3-jdk-8
     container_name: snowman-liquibase
+    restart: "no"
     working_dir: /app
     volumes:
       - ../../:/app
     command: >
       mvn liquibase:update
-      -Dliquibase.url=jdbc:mysql://mysql:3306/${DB_NAME}
-      -Dliquibase.username=${DB_USER}
+      -Dliquibase.url=jdbc:mysql://mysql:3306/snowman?useSSL=false&allowPublicKeyRetrieval=true
+      -Dliquibase.username=snowman_user
       -Dliquibase.password=${DB_PASSWORD}
+      -B -q
     depends_on:
       mysql:
         condition: service_healthy
     networks:
       - snowman-net
 
-  # ─── Snowman App Node 1 ───────────────────────────────────
+  # ─── Snowman App · Node 1 (primary) ───────────────────────
   snowman-app-1:
-    image: ${ACR_NAME}.azurecr.io/snowman-app:${IMAGE_TAG:-latest}
-    # For local builds without ACR, comment above and uncomment:
-    # build:
-    #   context: ../../
-    #   dockerfile: docker/Dockerfile
+    image: ${DOCKERHUB_USERNAME}/snowman-app:${IMAGE_TAG:-latest}
     container_name: snowman-app-1
     restart: unless-stopped
     environment:
-      DB_HOST: mysql
-      DB_PORT: 3306
-      DB_NAME: ${DB_NAME}
-      DB_USER: ${DB_USER}
-      DB_PASSWORD: ${DB_PASSWORD}
-      ACTIVEMQ_HOST: activemq
-      ACTIVEMQ_PORT: 61616
-      SERVER_PORT: 8080
-      SPRING_PROFILES_ACTIVE: local
+      DB_HOST:         mysql
+      DB_PORT:         3306
+      DB_NAME:         snowman
+      DB_USER:         snowman_user
+      DB_PASSWORD:     ${DB_PASSWORD}
+      ACTIVEMQ_HOST:   activemq
+      ACTIVEMQ_PORT:   61616
+      ACTIVEMQ_PASSWORD: ${ACTIVEMQ_PASSWORD}
+      SERVER_PORT:     8080
+      SPRING_PROFILES_ACTIVE: azure
     ports:
       - "8080:8080"
     depends_on:
@@ -107,30 +105,37 @@ services:
         condition: service_healthy
       liquibase-migrate:
         condition: service_completed_successfully
-    networks:
-      - snowman-net
     deploy:
       resources:
         limits:
           memory: 1G
         reservations:
           memory: 512M
+    networks:
+      - snowman-net
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/actuator/health"]
+      interval: 30s
+      timeout:  10s
+      retries:  5
+      start_period: 60s
 
-  # ─── Snowman App Node 2 ───────────────────────────────────
+  # ─── Snowman App · Node 2 (HA / load-balanced) ────────────
   snowman-app-2:
-    image: ${ACR_NAME}.azurecr.io/snowman-app:${IMAGE_TAG:-latest}
+    image: ${DOCKERHUB_USERNAME}/snowman-app:${IMAGE_TAG:-latest}
     container_name: snowman-app-2
     restart: unless-stopped
     environment:
-      DB_HOST: mysql
-      DB_PORT: 3306
-      DB_NAME: ${DB_NAME}
-      DB_USER: ${DB_USER}
-      DB_PASSWORD: ${DB_PASSWORD}
-      ACTIVEMQ_HOST: activemq
-      ACTIVEMQ_PORT: 61616
-      SERVER_PORT: 8080
-      SPRING_PROFILES_ACTIVE: local
+      DB_HOST:         mysql
+      DB_PORT:         3306
+      DB_NAME:         snowman
+      DB_USER:         snowman_user
+      DB_PASSWORD:     ${DB_PASSWORD}
+      ACTIVEMQ_HOST:   activemq
+      ACTIVEMQ_PORT:   61616
+      ACTIVEMQ_PASSWORD: ${ACTIVEMQ_PASSWORD}
+      SERVER_PORT:     8080
+      SPRING_PROFILES_ACTIVE: azure
     ports:
       - "8081:8080"
     depends_on:
@@ -140,17 +145,22 @@ services:
         condition: service_healthy
       liquibase-migrate:
         condition: service_completed_successfully
-    networks:
-      - snowman-net
     deploy:
       resources:
         limits:
           memory: 1G
         reservations:
           memory: 512M
+    networks:
+      - snowman-net
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/actuator/health"]
+      interval: 30s
+      timeout:  10s
+      retries:  5
+      start_period: 60s
 
-  # ─── NGINX Load Balancer (local dev only) ─────────────────
-  # In K8s/Azure this is replaced by nginx-ingress-controller
+  # ─── NGINX Load Balancer (round-robin across app-1 + app-2) ─
   nginx:
     image: nginx:alpine
     container_name: snowman-nginx
@@ -158,17 +168,19 @@ services:
     ports:
       - "80:80"
     volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
       - snowman-app-1
       - snowman-app-2
     networks:
       - snowman-net
 
+# ─── Volumes ────────────────────────────────────────────────
 volumes:
   mysql_data:
   activemq_data:
 
+# ─── Networks ───────────────────────────────────────────────
 networks:
   snowman-net:
     driver: bridge
