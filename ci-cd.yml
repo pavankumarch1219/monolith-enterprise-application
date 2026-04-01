@@ -1,290 +1,454 @@
 # ============================================================
-# Snowman Enterprise App - GitHub Actions CI/CD Pipeline
-# Triggers: push to main → build → test → deploy to AWS
+#  Snowman Enterprise App — Azure DevOps Unified CI/CD Pipeline
+#  Target  : Self-Hosted Agent VM  (Docker + k3s/kubeadm)
+#  Registry: Azure Container Registry (ACR)
+#  Stack   : Java/Maven · MySQL 5.7 · ActiveMQ · Liquibase · NGINX
 # ============================================================
- 
-name: Snowman CI/CD Pipeline
- 
-on:
-  push:
-    branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
-  workflow_dispatch:
-    inputs:
-      environment:
-        description: 'Target environment'
-        required: true
-        default: 'staging'
-        type: choice
-        options: [dev, staging, prod]
- 
-env:
-  JAVA_VERSION: '8'
-  AWS_REGION: 'ap-south-1'
-  ECR_REPOSITORY: 'snowman-app'
-  S3_ARTIFACT_BUCKET: 'snowman-artifacts-prod'
- 
-jobs:
- 
-  # ─── STAGE 1: BUILD & TEST ──────────────────────────────────────────────────
-  build-and-test:
-    name: Build & Test
-    runs-on: ubuntu-latest
- 
-    services:
-      mysql:
-        image: mysql:5.7
-        env:
-          MYSQL_ROOT_PASSWORD: rootpassword
-          MYSQL_DATABASE: snowman_test
-          MYSQL_USER: test_user
-          MYSQL_PASSWORD: test_pass
-        ports:
-          - 3306:3306
-        options: >-
-          --health-cmd="mysqladmin ping"
-          --health-interval=10s
-          --health-timeout=5s
-          --health-retries=5
- 
-      activemq:
-        image: rmohr/activemq:5.15.9
-        ports:
-          - 61616:61616
- 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
- 
-      - name: Set up Java ${{ env.JAVA_VERSION }}
-        uses: actions/setup-java@v4
-        with:
-          java-version: ${{ env.JAVA_VERSION }}
-          distribution: 'temurin'
-          cache: 'maven'
- 
-      - name: Cache Maven dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/.m2/repository
-          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
-          restore-keys: ${{ runner.os }}-maven-
- 
-      - name: Run Liquibase Migrations (Test DB)
-        run: |
-          mvn liquibase:update \
-            -Dliquibase.url=jdbc:mysql://localhost:3306/snowman_test \
-            -Dliquibase.username=test_user \
-            -Dliquibase.password=test_pass
- 
-      - name: Compile source code
-        run: mvn compile -B
- 
-      - name: Run Unit Tests
-        run: mvn test -B
- 
-      - name: Run Integration Tests
-        run: |
-          mvn verify -B \
-            -Ddb.url=jdbc:mysql://localhost:3306/snowman_test \
-            -Ddb.username=test_user \
-            -Ddb.password=test_pass \
-            -Dmq.host=localhost \
-            -Dmq.port=61616
- 
-      - name: Publish Test Results
-        uses: EnricoMi/publish-unit-test-result-action@v2
-        if: always()
-        with:
-          files: target/surefire-reports/*.xml
- 
-      - name: Build Uber JAR
-        run: mvn package -DskipTests -B
- 
-      - name: Set artifact version
-        id: version
-        run: echo "version=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)" >> $GITHUB_OUTPUT
- 
-      - name: Upload JAR artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: snowman-jar-${{ github.sha }}
-          path: target/Snowman.jar
-          retention-days: 30
- 
-  # ─── STAGE 2: CODE QUALITY ──────────────────────────────────────────────────
-  code-quality:
-    name: Code Quality
-    runs-on: ubuntu-latest
-    needs: build-and-test
- 
-    steps:
-      - uses: actions/checkout@v4
- 
-      - uses: actions/setup-java@v4
-        with:
-          java-version: ${{ env.JAVA_VERSION }}
-          distribution: 'temurin'
-          cache: 'maven'
- 
-      - name: Run SpotBugs Static Analysis
-        run: mvn spotbugs:check -B || true
- 
-      - name: Run PMD Analysis
-        run: mvn pmd:check -B || true
- 
-      - name: Run Checkstyle
-        run: mvn checkstyle:check -B || true
- 
-  # ─── STAGE 3: DOCKER BUILD & PUSH ───────────────────────────────────────────
-  docker-build-push:
-    name: Docker Build & Push to ECR
-    runs-on: ubuntu-latest
-    needs: [build-and-test, code-quality]
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
- 
-    steps:
-      - uses: actions/checkout@v4
- 
-      - name: Download built JAR
-        uses: actions/download-artifact@v4
-        with:
-          name: snowman-jar-${{ github.sha }}
-          path: target/
- 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
- 
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
- 
-      - name: Build, tag and push Docker image
-        env:
-          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          IMAGE_TAG: ${{ github.sha }}
-        run: |
-          docker build -f docker/Dockerfile -t $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker tag $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $REGISTRY/$ECR_REPOSITORY:latest
-          docker push $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          docker push $REGISTRY/$ECR_REPOSITORY:latest
-          echo "image=$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
- 
-      - name: Upload JAR to S3
-        run: |
-          aws s3 cp target/Snowman.jar \
-            s3://${{ env.S3_ARTIFACT_BUCKET }}/releases/${{ github.sha }}/Snowman.jar
-          aws s3 cp target/Snowman.jar \
-            s3://${{ env.S3_ARTIFACT_BUCKET }}/releases/latest/Snowman.jar
- 
-  # ─── STAGE 4: DEPLOY TO STAGING ─────────────────────────────────────────────
-  deploy-staging:
-    name: Deploy → Staging
-    runs-on: ubuntu-latest
-    needs: docker-build-push
-    environment:
-      name: staging
-      url: http://staging.snowman.internal
- 
-    steps:
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
- 
-      - name: Trigger Liquibase Migration (Staging)
-        run: |
-          aws ssm send-command \
-            --document-name "AWS-RunShellScript" \
-            --targets "Key=tag:Environment,Values=staging" \
-            --parameters 'commands=["cd /opt/snowman && mvn liquibase:update"]' \
-            --region ${{ env.AWS_REGION }}
- 
-      - name: Instance Refresh - Staging ASG
-        run: |
-          REFRESH_ID=$(aws autoscaling start-instance-refresh \
-            --auto-scaling-group-name snowman-staging-asg \
-            --strategy Rolling \
-            --preferences '{"MinHealthyPercentage": 50, "InstanceWarmup": 120}' \
-            --query 'InstanceRefreshId' \
-            --output text)
-          echo "Instance Refresh ID: $REFRESH_ID"
-          # Wait for completion
-          aws autoscaling wait instance-refresh-active \
-            --auto-scaling-group-name snowman-staging-asg \
-            --filters "Name=instance-refresh-id,Values=$REFRESH_ID" || true
- 
-      - name: Smoke Test Staging
-        run: |
-          sleep 60
-          curl --fail --retry 5 --retry-delay 10 \
-            http://${{ secrets.STAGING_ALB_DNS }}/health || exit 1
-          echo "✅ Staging smoke test passed"
- 
-  # ─── STAGE 5: DEPLOY TO PRODUCTION ──────────────────────────────────────────
-  deploy-prod:
-    name: Deploy → Production
-    runs-on: ubuntu-latest
-    needs: deploy-staging
-    environment:
-      name: production
-      url: http://snowman.yourdomain.com
- 
-    steps:
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
- 
-      - name: Run DB Migration (Production RDS)
-        run: |
-          aws ssm send-command \
-            --document-name "AWS-RunShellScript" \
-            --targets "Key=tag:Environment,Values=prod" \
-            --parameters 'commands=["cd /opt/snowman && mvn liquibase:update -Dliquibase.url=$DB_URL -Dliquibase.username=$DB_USER -Dliquibase.password=$DB_PASS"]' \
-            --region ${{ env.AWS_REGION }}
- 
-      - name: Rolling Deploy - Production ASG
-        run: |
-          aws autoscaling start-instance-refresh \
-            --auto-scaling-group-name snowman-prod-asg \
-            --strategy Rolling \
-            --preferences '{"MinHealthyPercentage": 75, "InstanceWarmup": 180}' \
-            --region ${{ env.AWS_REGION }}
- 
-      - name: Smoke Test Production
-        run: |
-          sleep 90
-          curl --fail --retry 10 --retry-delay 15 \
-            http://${{ secrets.PROD_ALB_DNS }}/health || exit 1
-          echo "✅ Production deployment verified"
- 
-      - name: Notify Slack on Success
-        if: success()
-        uses: slackapi/slack-github-action@v1.26.0
-        with:
-          payload: |
-            {
-              "text": "✅ Snowman v${{ github.sha }} deployed to PRODUCTION successfully!"
-            }
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
- 
-      - name: Notify Slack on Failure
-        if: failure()
-        uses: slackapi/slack-github-action@v1.26.0
-        with:
-          payload: |
-            {
-              "text": "❌ Snowman deployment to PRODUCTION FAILED! Commit: ${{ github.sha }}"
-            }
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
- 
+#
+#  Required ADO Variable Group  : snowman-variable-group
+#  Required ADO Service Connections:
+#    - "ACR-ServiceConnection"   (Docker Registry → ACR)
+#    - "Azure-ServiceConnection" (Azure Resource Manager → Service Principal)
+#
+#  Variable Group must contain (mark secrets as secret):
+#    ACR_NAME              e.g. yourregistry
+#    ACR_LOGIN_SERVER      e.g. yourregistry.azurecr.io
+#    ACR_USERNAME          (secret) from ACR Access Keys
+#    ACR_PASSWORD          (secret) from ACR Access Keys
+#    DB_HOST               Azure MySQL Flexible Server FQDN  OR  "mysql" for in-cluster
+#    DB_NAME               snowman
+#    DB_USER               snowman_user
+#    DB_PASSWORD           (secret)
+#    DB_ROOT_PASSWORD      (secret)
+#    ACTIVEMQ_HOST         activemq  (in-cluster service name)
+#    ACTIVEMQ_PORT         61616
+#    ACTIVEMQ_ADMIN_USER   admin
+#    ACTIVEMQ_ADMIN_PASS   (secret)
+#    AZURE_KEYVAULT_URI    https://your-kv.vault.azure.net/
+#    K8S_NAMESPACE         snowman
+# ============================================================
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+  paths:
+    exclude:
+      - README.md
+      - docs/**
+
+pr:
+  branches:
+    include:
+      - main
+
+pool:
+  name: 'SelfHostedAgentPool'      # ← your self-hosted agent pool name
+
+variables:
+  - group: snowman-variable-group
+  - name: IMAGE_NAME
+    value: 'snowman-app'
+  - name: IMAGE_TAG
+    value: '$(Build.BuildId)'
+  - name: K8S_NAMESPACE
+    value: 'snowman'
+  - name: MAVEN_CACHE_FOLDER
+    value: $(Pipeline.Workspace)/.m2/repository
+  - name: MAVEN_OPTS
+    value: '-Dmaven.repo.local=$(MAVEN_CACHE_FOLDER)'
+
+# ============================================================
+# STAGE 1 — BUILD & UNIT TEST
+# ============================================================
+stages:
+  - stage: Build
+    displayName: '1 · Build & Test'
+    jobs:
+      - job: MavenBuild
+        displayName: 'Maven build · unit tests · code coverage'
+        steps:
+
+          - task: Cache@2
+            displayName: 'Cache Maven local repo'
+            inputs:
+              key: 'maven | "$(Agent.OS)" | **/pom.xml'
+              restoreKeys: |
+                maven | "$(Agent.OS)"
+                maven
+              path: $(MAVEN_CACHE_FOLDER)
+
+          - task: Maven@4
+            displayName: 'mvn clean verify'
+            inputs:
+              mavenPomFile: 'pom.xml'
+              goals: 'clean verify'
+              options: '-B $(MAVEN_OPTS) -Dspring.profiles.active=test'
+              publishJUnitResults: true
+              testResultsFiles: '**/surefire-reports/TEST-*.xml'
+              codeCoverageToolOption: 'JaCoCo'
+              codeCoverageClassFilter: '+:com.snowman.*,-:com.snowman.*.config.*'
+              javaHomeOption: 'JDKVersion'
+              jdkVersionOption: '1.17'
+
+          - task: PublishCodeCoverageResults@1
+            displayName: 'Publish JaCoCo coverage'
+            inputs:
+              codeCoverageTool: 'JaCoCo'
+              summaryFileLocation: '**/jacoco.xml'
+              reportDirectory: '**/site/jacoco'
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish JAR artifact'
+            inputs:
+              targetPath: 'target'
+              artifact: 'app-jar'
+              publishLocation: 'pipeline'
+
+# ============================================================
+# STAGE 2 — DOCKER BUILD & PUSH TO ACR
+# ============================================================
+  - stage: DockerBuildPush
+    displayName: '2 · Docker Build & Push to ACR'
+    dependsOn: Build
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - job: DockerJob
+        displayName: 'Build image · push to ACR'
+        steps:
+
+          - download: current
+            artifact: app-jar
+            displayName: 'Download JAR artifact'
+
+          - script: |
+              mkdir -p target
+              cp $(Pipeline.Workspace)/app-jar/*.jar target/
+            displayName: 'Place JAR for Docker build context'
+
+          # ── ACR Login ──────────────────────────────────────
+          - task: Docker@2
+            displayName: 'ACR Login'
+            inputs:
+              command: 'login'
+              containerRegistry: 'ACR-ServiceConnection'
+
+          # ── Build snowman-app image ────────────────────────
+          - task: Docker@2
+            displayName: 'Build snowman-app image'
+            inputs:
+              command: 'build'
+              Dockerfile: 'docker/Dockerfile'
+              repository: '$(ACR_LOGIN_SERVER)/$(IMAGE_NAME)'
+              tags: |
+                $(IMAGE_TAG)
+                latest
+              arguments: '--no-cache --build-arg BUILD_DATE=$(Build.BuildId)'
+
+          # ── Push to ACR ────────────────────────────────────
+          - task: Docker@2
+            displayName: 'Push to ACR'
+            inputs:
+              command: 'push'
+              containerRegistry: 'ACR-ServiceConnection'
+              repository: '$(IMAGE_NAME)'
+              tags: |
+                $(IMAGE_TAG)
+                latest
+
+          # ── Trivy security scan ────────────────────────────
+          - script: |
+              echo "Installing Trivy..."
+              curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+              trivy image \
+                --exit-code 0 \
+                --severity HIGH,CRITICAL \
+                --format table \
+                $(ACR_LOGIN_SERVER)/$(IMAGE_NAME):$(IMAGE_TAG)
+            displayName: 'Trivy image vulnerability scan'
+            continueOnError: true
+
+          # ── Publish K8s manifests for CD stage ────────────
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish K8s manifests'
+            inputs:
+              targetPath: 'k8s'
+              artifact: 'k8s-manifests'
+              publishLocation: 'pipeline'
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish docker-compose (for reference)'
+            inputs:
+              targetPath: 'docker/local'
+              artifact: 'docker-compose'
+              publishLocation: 'pipeline'
+
+# ============================================================
+# STAGE 3 — DATABASE MIGRATION (Liquibase via kubectl Job)
+# ============================================================
+  - stage: DBMigration
+    displayName: '3 · Liquibase DB Migration'
+    dependsOn: DockerBuildPush
+    condition: succeeded()
+    jobs:
+      - deployment: LiquibaseMigrate
+        displayName: 'Run Liquibase migration on Azure MySQL'
+        environment: 'snowman-production'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+
+                - task: AzureKeyVault@2
+                  displayName: 'Fetch DB secrets from Key Vault'
+                  inputs:
+                    azureSubscription: 'Azure-ServiceConnection'
+                    KeyVaultName: '$(AZURE_KEYVAULT_URI)'
+                    SecretsFilter: 'DB-PASSWORD,DB-USER,DB-HOST,DB-NAME'
+                    RunAsPreJob: true
+
+                - download: current
+                  artifact: k8s-manifests
+                  displayName: 'Download K8s manifests'
+
+                # Run Liquibase as a one-off kubectl Job
+                - script: |
+                    cat <<EOF | kubectl apply -f -
+                    apiVersion: batch/v1
+                    kind: Job
+                    metadata:
+                      name: liquibase-migrate-$(Build.BuildId)
+                      namespace: $(K8S_NAMESPACE)
+                    spec:
+                      ttlSecondsAfterFinished: 300
+                      template:
+                        spec:
+                          restartPolicy: OnFailure
+                          containers:
+                            - name: liquibase
+                              image: liquibase/liquibase:4.25
+                              command:
+                                - liquibase
+                                - --url=jdbc:mysql://$(DB_HOST):3306/$(DB_NAME)?useSSL=true&requireSSL=true
+                                - --username=$(DB_USER)
+                                - --password=$(DB_PASSWORD)
+                                - --changeLogFile=db/changelog/db.changelog-master.xml
+                                - update
+                              env:
+                                - name: JAVA_OPTS
+                                  value: "-Xmx256m"
+                              volumeMounts:
+                                - name: changelog
+                                  mountPath: /liquibase/changelog
+                          volumes:
+                            - name: changelog
+                              configMap:
+                                name: liquibase-changelog
+                    EOF
+
+                    echo "Waiting for Liquibase job to complete..."
+                    kubectl wait job/liquibase-migrate-$(Build.BuildId) \
+                      --for=condition=complete \
+                      --timeout=300s \
+                      --namespace=$(K8S_NAMESPACE)
+
+                    echo "=== Liquibase Job Logs ==="
+                    kubectl logs -l job-name=liquibase-migrate-$(Build.BuildId) \
+                      --namespace=$(K8S_NAMESPACE)
+                  displayName: 'Apply Liquibase migration Job'
+
+# ============================================================
+# STAGE 4 — DEPLOY TO AGENT VM (kubectl apply)
+# ============================================================
+  - stage: Deploy
+    displayName: '4 · Deploy to Agent VM K8s'
+    dependsOn: DBMigration
+    condition: succeeded()
+    jobs:
+      - deployment: K8sDeploy
+        displayName: 'kubectl apply → rolling deploy'
+        environment: 'snowman-production'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+
+                - task: AzureKeyVault@2
+                  displayName: 'Fetch all secrets from Key Vault'
+                  inputs:
+                    azureSubscription: 'Azure-ServiceConnection'
+                    KeyVaultName: '$(AZURE_KEYVAULT_URI)'
+                    SecretsFilter: '*'
+                    RunAsPreJob: true
+
+                - download: current
+                  artifact: k8s-manifests
+                  displayName: 'Download K8s manifests'
+
+                # ── Create namespace ───────────────────────────
+                - script: |
+                    kubectl create namespace $(K8S_NAMESPACE) \
+                      --dry-run=client -o yaml | kubectl apply -f -
+                  displayName: 'Ensure namespace exists'
+
+                # ── ACR image pull secret ─────────────────────
+                - script: |
+                    kubectl create secret docker-registry acr-pull-secret \
+                      --docker-server=$(ACR_LOGIN_SERVER) \
+                      --docker-username=$(ACR_USERNAME) \
+                      --docker-password=$(ACR_PASSWORD) \
+                      --namespace=$(K8S_NAMESPACE) \
+                      --dry-run=client -o yaml | kubectl apply -f -
+                  displayName: 'Create/update ACR pull secret'
+
+                # ── App secrets (DB + ActiveMQ) ────────────────
+                - script: |
+                    kubectl create secret generic snowman-secrets \
+                      --from-literal=DB_HOST="$(DB_HOST)" \
+                      --from-literal=DB_NAME="$(DB_NAME)" \
+                      --from-literal=DB_USER="$(DB_USER)" \
+                      --from-literal=DB_PASSWORD="$(DB_PASSWORD)" \
+                      --from-literal=DB_ROOT_PASSWORD="$(DB_ROOT_PASSWORD)" \
+                      --from-literal=ACTIVEMQ_HOST="$(ACTIVEMQ_HOST)" \
+                      --from-literal=ACTIVEMQ_PORT="$(ACTIVEMQ_PORT)" \
+                      --from-literal=ACTIVEMQ_ADMIN_USER="$(ACTIVEMQ_ADMIN_USER)" \
+                      --from-literal=ACTIVEMQ_ADMIN_PASS="$(ACTIVEMQ_ADMIN_PASS)" \
+                      --namespace=$(K8S_NAMESPACE) \
+                      --dry-run=client -o yaml | kubectl apply -f -
+                  displayName: 'Create/update app secrets'
+
+                # ── Substitute image tag in deployment YAML ────
+                - script: |
+                    MANIFEST_DIR="$(Pipeline.Workspace)/k8s-manifests"
+                    sed -i \
+                      "s|IMAGE_PLACEHOLDER|$(ACR_LOGIN_SERVER)/$(IMAGE_NAME):$(IMAGE_TAG)|g" \
+                      "$MANIFEST_DIR/deployment.yaml"
+                    echo "--- deployment.yaml image line ---"
+                    grep "image:" "$MANIFEST_DIR/deployment.yaml"
+                  displayName: 'Inject ACR image tag into deployment.yaml'
+
+                # ── Apply all manifests in order ──────────────
+                - script: |
+                    MANIFEST_DIR="$(Pipeline.Workspace)/k8s-manifests"
+
+                    echo "==> ConfigMap"
+                    kubectl apply -f "$MANIFEST_DIR/configmap.yaml"
+
+                    echo "==> MySQL StatefulSet + Service (in-cluster)"
+                    kubectl apply -f "$MANIFEST_DIR/mysql.yaml"
+
+                    echo "==> ActiveMQ Deployment + Service"
+                    kubectl apply -f "$MANIFEST_DIR/activemq.yaml"
+
+                    echo "==> Snowman App Deployment"
+                    kubectl apply -f "$MANIFEST_DIR/deployment.yaml"
+
+                    echo "==> Snowman Service"
+                    kubectl apply -f "$MANIFEST_DIR/service.yaml"
+
+                    echo "==> NGINX Ingress"
+                    kubectl apply -f "$MANIFEST_DIR/ingress.yaml"
+
+                    echo "==> HPA"
+                    kubectl apply -f "$MANIFEST_DIR/hpa.yaml"
+                  displayName: 'kubectl apply all manifests'
+
+                # ── Wait for rollout ───────────────────────────
+                - script: |
+                    echo "Waiting for snowman-app rollout..."
+                    kubectl rollout status deployment/snowman-app \
+                      --namespace=$(K8S_NAMESPACE) \
+                      --timeout=300s
+                  displayName: 'Wait for rollout to complete'
+
+                # ── Health check after deploy ──────────────────
+                - script: |
+                    echo "=== Pods ==="
+                    kubectl get pods -n $(K8S_NAMESPACE) -o wide
+
+                    echo "=== Services ==="
+                    kubectl get svc -n $(K8S_NAMESPACE)
+
+                    echo "=== HPA ==="
+                    kubectl get hpa -n $(K8S_NAMESPACE)
+
+                    echo "=== Recent events ==="
+                    kubectl get events -n $(K8S_NAMESPACE) \
+                      --sort-by='.lastTimestamp' | tail -20
+
+                    echo "=== App health endpoint ==="
+                    NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+                    curl -sf "http://$NODE_IP:30080/actuator/health" \
+                      && echo "Health check PASSED" \
+                      || echo "Health check endpoint not yet ready (check pod logs)"
+                  displayName: 'Post-deploy verification'
+
+# ============================================================
+# STAGE 5 — SMOKE TEST
+# ============================================================
+  - stage: SmokeTest
+    displayName: '5 · Smoke Test'
+    dependsOn: Deploy
+    condition: succeeded()
+    jobs:
+      - job: SmokeJob
+        displayName: 'Basic availability checks'
+        steps:
+          - script: |
+              NODE_IP=$(kubectl get nodes -n $(K8S_NAMESPACE) \
+                -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+
+              echo "Testing app node 1 (port 30080)..."
+              for i in 1 2 3; do
+                STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+                  "http://$NODE_IP:30080/actuator/health" || echo "000")
+                echo "Attempt $i — HTTP $STATUS"
+                [ "$STATUS" = "200" ] && break
+                sleep 10
+              done
+
+              if [ "$STATUS" != "200" ]; then
+                echo "SMOKE TEST FAILED — app not responding"
+                kubectl logs -l app=snowman-app \
+                  --namespace=$(K8S_NAMESPACE) --tail=50
+                exit 1
+              fi
+
+              echo "Checking ActiveMQ admin UI (port 30161)..."
+              AMQ_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+                -u $(ACTIVEMQ_ADMIN_USER):$(ACTIVEMQ_ADMIN_PASS) \
+                "http://$NODE_IP:30161/admin" || echo "000")
+              echo "ActiveMQ admin HTTP $AMQ_STATUS"
+
+              echo "All smoke tests passed."
+            displayName: 'Availability smoke tests'
+
+          - script: |
+              echo "=== Final deployment summary ==="
+              kubectl get all -n $(K8S_NAMESPACE)
+            displayName: 'Print final deployment state'
+
+# ============================================================
+# STAGE 6 — ROLLBACK (manual trigger on failure)
+# ============================================================
+  - stage: Rollback
+    displayName: '6 · Rollback (on-demand)'
+    dependsOn: Deploy
+    condition: failed()
+    jobs:
+      - job: RollbackJob
+        displayName: 'kubectl rollout undo'
+        steps:
+          - script: |
+              echo "Rolling back snowman-app to previous revision..."
+              kubectl rollout undo deployment/snowman-app \
+                --namespace=$(K8S_NAMESPACE)
+
+              kubectl rollout status deployment/snowman-app \
+                --namespace=$(K8S_NAMESPACE) \
+                --timeout=180s
+
+              echo "=== Post-rollback pods ==="
+              kubectl get pods -n $(K8S_NAMESPACE)
+            displayName: 'Automatic rollback on deploy failure'
