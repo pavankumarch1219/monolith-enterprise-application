@@ -1,0 +1,73 @@
+# ============================================================
+# Apache ActiveMQ 5.15.9  (matches docker-compose version)
+# ============================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: snowman-activemq
+  namespace: snowman
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: snowman-activemq
+  template:
+    metadata:
+      labels:
+        app: snowman-activemq
+    spec:
+      containers:
+        - name: activemq
+          image: rmohr/activemq:5.15.9
+          ports:
+            - containerPort: 61616   # JMS
+            - containerPort: 8161    # Admin UI
+          env:
+            - name: ACTIVEMQ_ADMIN_LOGIN
+              value: admin
+            - name: ACTIVEMQ_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: snowman-app-secrets
+                  key: ACTIVEMQ_PASSWORD
+          volumeMounts:
+            - name: activemq-data
+              mountPath: /opt/activemq/data
+          livenessProbe:
+            httpGet:
+              path: /admin
+              port: 8161
+              httpHeaders:
+                - name: Authorization
+                  value: Basic YWRtaW46YWRtaW4=   # admin:admin base64
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "300m"
+      volumes:
+        - name: activemq-data
+          emptyDir: {}   # swap to PVC for persistence in prod
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: activemq
+  namespace: snowman
+spec:
+  selector:
+    app: snowman-activemq
+  ports:
+    - name: jms
+      port: 61616
+      targetPort: 61616
+    - name: admin
+      port: 8161
+      targetPort: 8161
+      nodePort: 30161
+  type: NodePort
