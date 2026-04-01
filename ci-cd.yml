@@ -2,18 +2,6 @@ trigger:
   branches:
     include:
       - main
-      - develop
-  paths:
-    exclude:
-      - '*.md'
-      - 'docs/**'
-
-pr:
-  branches:
-    include:
-      - main
-
-# ── Agent Pool (self-hosted VM with Docker + kubectl) ──────────
 pool:
   name: 'agent-agni'      # ← your ADO agent pool name
 
