@@ -1,53 +1,102 @@
+# ============================================================
+# Snowman App — K8s Deployment
+# Image source : DockerHub  (DOCKERHUB_USERNAME/snowman-app)
+# Replicas     : 2  (mirrors compose app-1 + app-2)
+# IMAGE_PLACEHOLDER replaced by pipeline `sed` at deploy time
+# ============================================================
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: monolith-app
-  namespace: monolith
+  name: snowman-app
+  namespace: snowman
   labels:
-    app: monolith
+    app: snowman-app
 spec:
   replicas: 2
   selector:
     matchLabels:
-      app: monolith
+      app: snowman-app
   strategy:
     type: RollingUpdate
     rollingUpdate:
       maxSurge: 1
-      maxUnavailable: 0
+      maxUnavailable: 0          # zero-downtime rolling update
   template:
     metadata:
       labels:
-        app: monolith
+        app: snowman-app
     spec:
+      # ── DockerHub pull secret (needed for private repo) ────
+      # Remove imagePullSecrets block if your DockerHub repo is public
       imagePullSecrets:
-        - name: acr-secret
+        - name: dockerhub-pull-secret
+
+      # ── Wait for MySQL + ActiveMQ before app starts ────────
+      initContainers:
+        - name: wait-for-mysql
+          image: busybox:1.35
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for MySQL on mysql:3306..."
+              until nc -z mysql 3306; do sleep 4; done
+              echo "MySQL ready."
+
+        - name: wait-for-activemq
+          image: busybox:1.35
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for ActiveMQ on activemq:61616..."
+              until nc -z activemq 61616; do sleep 4; done
+              echo "ActiveMQ ready."
+
       containers:
-        - name: monolith
-          image: <YOUR_ACR_NAME>.azurecr.io/monolith-app:$(IMAGE_TAG)
+        - name: snowman
+          image: IMAGE_PLACEHOLDER          # ← injected by pipeline
           ports:
             - containerPort: 8080
+          # Non-secret env from ConfigMap
           envFrom:
             - configMapRef:
-                name: monolith-config
-            - secretRef:
-                name: monolith-secrets
+                name: snowman-config
+          # Secret env from K8s Secret (Key Vault backed)
+          env:
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: snowman-app-secrets
+                  key: DB_PASSWORD
+            - name: ACTIVEMQ_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: snowman-app-secrets
+                  key: ACTIVEMQ_PASSWORD
           resources:
             requests:
-              memory: "256Mi"
+              memory: "512Mi"          # matches compose reservations
               cpu: "250m"
             limits:
-              memory: "512Mi"
-              cpu: "500m"
+              memory: "1Gi"            # matches compose limits
+              cpu: "750m"
           livenessProbe:
             httpGet:
               path: /actuator/health
               port: 8080
-            initialDelaySeconds: 45
-            periodSeconds: 15
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
           readinessProbe:
             httpGet:
               path: /actuator/health/readiness
               port: 8080
-            initialDelaySeconds: 30
+            initialDelaySeconds: 45
             periodSeconds: 10
+            timeoutSeconds: 5
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 10"]  # graceful drain
