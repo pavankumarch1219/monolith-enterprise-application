@@ -15,11 +15,11 @@ pr:
 
 # ── Agent Pool (self-hosted VM with Docker + kubectl) ──────────
 pool:
-  name: 'SelfHostedAgentPool'      # ← your ADO agent pool name
+  name: 'agent-agni'      # ← your ADO agent pool name
 
 # ── Variables (pulled from ADO Library Variable Group) ─────────
 variables:
-  - group: snowman-variable-group  # contains docker-credentials
+  - group: docker-credentials  # contains docker-credentials
   - name: IMAGE_NAME
     value: '$(DOCKERHUB_USERNAME)/snowman-app'
   - name: IMAGE_TAG
