@@ -200,7 +200,7 @@ stages:
                 # ── Deploy MySQL StatefulSet ───────────────────
                 - script: |
                     kubectl apply \
-                      -f $(Pipeline.Workspace)/k8s-manifests/mysql/mysql.yaml \
+                      -f $(Pipeline.Workspace)/k8s/mysql.yaml \
                       --namespace=$(K8S_NAMESPACE)
 
                     echo "Waiting for MySQL StatefulSet..."
@@ -213,7 +213,7 @@ stages:
                 # ── Deploy ActiveMQ ────────────────────────────
                 - script: |
                     kubectl apply \
-                      -f $(Pipeline.Workspace)/k8s-manifests/activemq/activemq.yaml \
+                      -f $(Pipeline.Workspace)/k8s/activemq.yaml \
                       --namespace=$(K8S_NAMESPACE)
 
                     echo "Waiting for ActiveMQ..."
@@ -232,7 +232,7 @@ stages:
 
                     # Apply fresh job
                     kubectl apply \
-                      -f $(Pipeline.Workspace)/k8s-manifests/liquibase/liquibase-job.yaml \
+                      -f $(Pipeline.Workspace)/k8s/liquibasejob.yaml \
                       --namespace=$(K8S_NAMESPACE)
 
                     echo "Waiting for Liquibase migration to complete..."
@@ -265,11 +265,11 @@ stages:
 
                 - download: current
                   artifact: k8s-manifests
-                  displayName: 'Download K8s manifests'
+                  displayName: 'Download K8s'
 
                 # ── Inject DockerHub image tag into Deployment ─
                 - script: |
-                    MANIFEST=$(Pipeline.Workspace)/k8s-manifests/app/deployment.yaml
+                    MANIFEST=$(Pipeline.Workspace)/k8s/deployment.yaml
 
                     sed -i \
                       "s|IMAGE_PLACEHOLDER|$(IMAGE_NAME):$(IMAGE_TAG)|g" \
@@ -282,7 +282,7 @@ stages:
                 # ── Apply ConfigMap ────────────────────────────
                 - script: |
                     kubectl apply \
-                      -f $(Pipeline.Workspace)/k8s-manifests/app/service-hpa-ingress.yaml \
+                      -f $(Pipeline.Workspace)/k8s/service-hpa-ingress.yaml \
                       --namespace=$(K8S_NAMESPACE)
                     echo "ConfigMap, Service, HPA, Ingress applied"
                   displayName: 'Apply ConfigMap · Service · HPA · Ingress'
@@ -290,7 +290,7 @@ stages:
                 # ── Rolling Deployment ─────────────────────────
                 - script: |
                     kubectl apply \
-                      -f $(Pipeline.Workspace)/k8s-manifests/app/deployment.yaml \
+                      -f $(Pipeline.Workspace)/k8s/deployment.yaml \
                       --namespace=$(K8S_NAMESPACE)
                     echo "Deployment applied — rolling update started"
                   displayName: 'Apply Deployment (rolling update)'
