@@ -1,0 +1,15 @@
+spring:
+  datasource:
+    url: ${DB_URL}
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
+  application:
+    name: monolith-enterprise-app
+
+server:
+  port: 8080
+
+azure:
+  keyvault:
+    enabled: true
+    uri: ${AZURE_KEYVAULT_URI}
