@@ -1,5 +1,5 @@
 trigger:
-    - main
+    - master
 pool:
   name: 'agent-agni'      # ← your ADO agent pool name
 
