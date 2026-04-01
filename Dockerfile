@@ -1,9 +1,3 @@
-# ============================================================
-# Snowman Enterprise App — Multi-stage Dockerfile
-# Registry : DockerHub  (no ACR needed)
-# JDK      : 8  (matches maven:3.6.3-jdk-8 in compose stack)
-# ============================================================
-
 # ── Stage 1 · Build ─────────────────────────────────────────
 FROM maven:3.6.3-jdk-8 AS builder
 
