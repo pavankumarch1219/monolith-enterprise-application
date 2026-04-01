@@ -1,0 +1,56 @@
+# ============================================================
+# Liquibase Migration Job
+# Runs ONCE per pipeline — deleted after success
+# Matches docker-compose liquibase-migrate service
+# ============================================================
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: snowman-liquibase
+  namespace: snowman
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 240
+  template:
+    spec:
+      restartPolicy: OnFailure
+      initContainers:
+        # Wait for MySQL to be ready before running migrations
+        - name: wait-for-mysql
+          image: busybox:1.35
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z mysql 3306; do
+                echo "Waiting for MySQL on mysql:3306..."
+                sleep 5
+              done
+              echo "MySQL is up!"
+      containers:
+        - name: liquibase
+          image: maven:3.6.3-jdk-8
+          workingDir: /app
+          command:
+            - mvn
+            - liquibase:update
+            - -Dliquibase.url=jdbc:mysql://mysql:3306/snowman?useSSL=false&allowPublicKeyRetrieval=true
+            - -Dliquibase.username=snowman_user
+            - -Dliquibase.password=$(DB_PASSWORD)
+            - -B
+            - -q
+          env:
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: snowman-app-secrets
+                  key: DB_PASSWORD
+          volumeMounts:
+            - name: app-source
+              mountPath: /app
+      volumes:
+        # Mount your source (only needed for Liquibase changesets)
+        # In CI this is handled by pipeline workspace — this is fallback
+        - name: app-source
+          emptyDir: {}
+ 
