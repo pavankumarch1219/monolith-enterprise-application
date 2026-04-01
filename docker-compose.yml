@@ -1,5 +1,5 @@
 version: '3.8'
-
+ 
 # ============================================================
 # Snowman Enterprise App — Docker Compose
 # Registry  : DockerHub  (image pulled from DOCKERHUB_USERNAME/snowman-app)
@@ -9,9 +9,9 @@ version: '3.8'
 #   Local dev  → docker compose --env-file .env.local up
 #   Production → image tag injected by ADO pipeline via IMAGE_TAG env var
 # ============================================================
-
+ 
 services:
-
+ 
   # ─── MySQL 5.7 ────────────────────────────────────────────
   mysql:
     image: mysql:5.7
@@ -36,7 +36,7 @@ services:
       start_period: 30s
     networks:
       - snowman-net
-
+ 
   # ─── Apache ActiveMQ 5.15.9 (JMS Broker) ─────────────────
   activemq:
     image: rmohr/activemq:5.15.9
@@ -59,7 +59,7 @@ services:
       start_period: 20s
     networks:
       - snowman-net
-
+ 
   # ─── Liquibase DB Migration (run-once job) ─────────────────
   liquibase-migrate:
     image: maven:3.6.3-jdk-8
@@ -79,7 +79,7 @@ services:
         condition: service_healthy
     networks:
       - snowman-net
-
+ 
   # ─── Snowman App · Node 1 (primary) ───────────────────────
   snowman-app-1:
     image: ${DOCKERHUB_USERNAME}/snowman-app:${IMAGE_TAG:-latest}
@@ -119,7 +119,7 @@ services:
       timeout:  10s
       retries:  5
       start_period: 60s
-
+ 
   # ─── Snowman App · Node 2 (HA / load-balanced) ────────────
   snowman-app-2:
     image: ${DOCKERHUB_USERNAME}/snowman-app:${IMAGE_TAG:-latest}
@@ -159,7 +159,7 @@ services:
       timeout:  10s
       retries:  5
       start_period: 60s
-
+ 
   # ─── NGINX Load Balancer (round-robin across app-1 + app-2) ─
   nginx:
     image: nginx:alpine
@@ -174,13 +174,14 @@ services:
       - snowman-app-2
     networks:
       - snowman-net
-
+ 
 # ─── Volumes ────────────────────────────────────────────────
 volumes:
   mysql_data:
   activemq_data:
-
+ 
 # ─── Networks ───────────────────────────────────────────────
 networks:
   snowman-net:
     driver: bridge
+ 
